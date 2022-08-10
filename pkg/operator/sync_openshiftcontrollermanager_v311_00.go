@@ -33,54 +33,81 @@ import (
 
 // syncOpenShiftControllerManager_v311_00_to_latest takes care of synchronizing (not upgrading) the thing we're managing.
 // most of the time the sync method will be good for a large span of minor versions
-func syncOpenShiftControllerManager_v311_00_to_latest(c OpenShiftControllerManagerOperator, originalOperatorConfig *operatorapiv1.OpenShiftControllerManager) (bool, error) {
+func syncOpenShiftControllerManager_v311_00_to_latest(c OpenShiftControllerManagerOperator, originalOperatorConfig *operatorapiv1.OpenShiftControllerManager, countNodes nodeCountFunc) (bool, error) {
 	errors := []error{}
 	var err error
 	operatorConfig := originalOperatorConfig.DeepCopy()
 
 	// TODO - use labels/annotations to force a daemonset rollout
 	forceRollout := false
+	rcForceRollout := false
 
+	operandName := "openshift-controller-manager"
+	rcOperandName := "route-controller-manager"
+
+	// OpenShift Controller Manager
 	_, configMapModified, err := manageOpenShiftControllerManagerConfigMap_v311_00_to_latest(c.kubeClient, c.configMapsGetter, c.recorder, operatorConfig)
 	if err != nil {
-		errors = append(errors, fmt.Errorf("%q: %v", "configmap", err))
+		errors = append(errors, fmt.Errorf("%q %q: %v", operandName, "configmap", err))
 	}
 	// the kube-apiserver is the source of truth for client CA bundles
 	clientCAModified, err := manageOpenShiftControllerManagerClientCA_v311_00_to_latest(c.kubeClient.CoreV1(), c.recorder)
 	if err != nil {
-		errors = append(errors, fmt.Errorf("%q: %v", "client-ca", err))
+		errors = append(errors, fmt.Errorf("%q %q: %v", operandName, "client-ca", err))
 	}
 
 	_, serviceCAModified, err := manageOpenShiftServiceCAConfigMap_v311_00_to_latest(c.kubeClient, c.configMapsGetter, c.recorder)
 	if err != nil {
-		errors = append(errors, fmt.Errorf("%q: %v", "openshift-service-ca", err))
+		errors = append(errors, fmt.Errorf("%q %q: %v", operandName, "openshift-service-ca", err))
 	}
 
 	_, globalCAModified, err := manageOpenShiftGlobalCAConfigMap_v311_00_to_latest(c.kubeClient, c.configMapsGetter, c.recorder)
 	if err != nil {
-		errors = append(errors, fmt.Errorf("%q: %v", "openshift-global-ca", err))
+		errors = append(errors, fmt.Errorf("%q %q: %v", operandName, "openshift-global-ca", err))
+	}
+
+	// Route Controller Manager
+	_, rcConfigMapModified, err := manageRouteControllerManagerConfigMap_v311_00_to_latest(c.kubeClient, c.configMapsGetter, c.recorder, operatorConfig)
+	if err != nil {
+		errors = append(errors, fmt.Errorf("%q %q: %v", rcOperandName, "configmap", err))
+	}
+
+	// the kube-apiserver is the source of truth for client CA bundles
+	rcClientCAModified, err := manageRouteControllerManagerClientCA_v311_00_to_latest(c.kubeClient.CoreV1(), c.recorder)
+	if err != nil {
+		errors = append(errors, fmt.Errorf("%q %q: %v", rcOperandName, "client-ca", err))
 	}
 
 	forceRollout = forceRollout || operatorConfig.ObjectMeta.Generation != operatorConfig.Status.ObservedGeneration
 	forceRollout = forceRollout || configMapModified || clientCAModified || serviceCAModified || globalCAModified
+
+	rcForceRollout = rcForceRollout || operatorConfig.ObjectMeta.Generation != operatorConfig.Status.ObservedGeneration
+	rcForceRollout = rcForceRollout || rcConfigMapModified || rcClientCAModified
 
 	// our configmaps and secrets are in order, now it is time to create the DS
 	// TODO check basic preconditions here
 	var progressingMessages []string
 	actualDaemonSet, _, err := manageOpenShiftControllerManagerDeployment_v311_00_to_latest(c.kubeClient.AppsV1(), c.recorder, operatorConfig, c.targetImagePullSpec, operatorConfig.Status.Generations, forceRollout, c.proxyLister)
 	if err != nil {
-		msg := fmt.Sprintf("%q: %v", "deployment", err)
+		msg := fmt.Sprintf("%q %q: %v", operandName, "deployment", err)
+		progressingMessages = append(progressingMessages, msg)
+		errors = append(errors, fmt.Errorf(msg))
+	}
+
+	actualRCDeployment, _, err := manageRouteControllerManagerDeployment_v311_00_to_latest(c.kubeClient.AppsV1(), countNodes, c.recorder, operatorConfig, c.targetImagePullSpec, operatorConfig.Status.Generations, rcForceRollout)
+	if err != nil {
+		msg := fmt.Sprintf("%q %q: %v", rcOperandName, "deployment", err)
 		progressingMessages = append(progressingMessages, msg)
 		errors = append(errors, fmt.Errorf(msg))
 	}
 
 	// library-go func called by manageOpenShiftControllerManagerDeployment_v311_00_to_latest can return nil with errors
-	if actualDaemonSet == nil {
+	if actualDaemonSet == nil || actualRCDeployment == nil {
 		return syncReturn(c, errors, originalOperatorConfig, operatorConfig)
 	}
 
 	// manage status
-	if actualDaemonSet.Status.NumberAvailable > 0 {
+	if actualDaemonSet.Status.NumberAvailable > 0 && actualRCDeployment.Status.AvailableReplicas > 0 {
 		v1helpers.SetOperatorCondition(&operatorConfig.Status.Conditions, operatorapiv1.OperatorCondition{
 			Type:   operatorapiv1.OperatorStatusTypeAvailable,
 			Status: operatorapiv1.ConditionTrue,
@@ -137,7 +164,6 @@ func syncOpenShiftControllerManager_v311_00_to_latest(c OpenShiftControllerManag
 	resourcemerge.SetDaemonSetGeneration(&operatorConfig.Status.Generations, actualDaemonSet)
 
 	return syncReturn(c, errors, originalOperatorConfig, operatorConfig)
-
 }
 
 func syncReturn(c OpenShiftControllerManagerOperator, errors []error, originalOperatorConfig, operatorConfig *operatorapiv1.OpenShiftControllerManager) (bool, error) {
@@ -180,6 +206,15 @@ func manageOpenShiftControllerManagerClientCA_v311_00_to_latest(client coreclien
 	return caChanged, nil
 }
 
+func manageRouteControllerManagerClientCA_v311_00_to_latest(client coreclientv1.ConfigMapsGetter, recorder events.Recorder) (bool, error) {
+	const apiserverClientCA = "client-ca"
+	_, caChanged, err := resourceapply.SyncConfigMap(context.Background(), client, recorder, util.KubeAPIServerNamespace, apiserverClientCA, util.RouteControllerTargetNamespace, apiserverClientCA, []metav1.OwnerReference{})
+	if err != nil {
+		return false, err
+	}
+	return caChanged, nil
+}
+
 func manageOpenShiftControllerManagerConfigMap_v311_00_to_latest(kubeClient kubernetes.Interface, client coreclientv1.ConfigMapsGetter, recorder events.Recorder, operatorConfig *operatorapiv1.OpenShiftControllerManager) (*corev1.ConfigMap, bool, error) {
 	configMap := resourceread.ReadConfigMapV1OrDie(v311_00_assets.MustAsset("v3.11.0/openshift-controller-manager/cm.yaml"))
 	defaultConfig := v311_00_assets.MustAsset("v3.11.0/config/defaultconfig.yaml")
@@ -196,6 +231,31 @@ func manageOpenShiftControllerManagerConfigMap_v311_00_to_latest(kubeClient kube
 		resourcehash.NewObjectRef().ForSecret().InNamespace(util.TargetNamespace).Named("serving-cert"),
 		resourcehash.NewObjectRef().ForConfigMap().InNamespace(util.TargetNamespace).Named("openshift-global-ca"),
 		resourcehash.NewObjectRef().ForConfigMap().InNamespace(util.TargetNamespace).Named("openshift-user-ca"),
+	)
+	if err != nil {
+		return nil, false, err
+	}
+	for k, v := range inputHashes {
+		requiredConfigMap.Data[k] = v
+	}
+
+	return resourceapply.ApplyConfigMap(context.Background(), client, recorder, requiredConfigMap)
+}
+
+func manageRouteControllerManagerConfigMap_v311_00_to_latest(kubeClient kubernetes.Interface, client coreclientv1.ConfigMapsGetter, recorder events.Recorder, operatorConfig *operatorapiv1.OpenShiftControllerManager) (*corev1.ConfigMap, bool, error) {
+	configMap := resourceread.ReadConfigMapV1OrDie(v311_00_assets.MustAsset("v3.11.0/openshift-controller-manager/route-controller-cm.yaml"))
+	defaultConfig := v311_00_assets.MustAsset("v3.11.0/config/defaultconfig.yaml")
+	requiredConfigMap, _, err := resourcemerge.MergeConfigMap(configMap, "config.yaml", nil, defaultConfig, operatorConfig.Spec.ObservedConfig.Raw, operatorConfig.Spec.UnsupportedConfigOverrides.Raw)
+	if err != nil {
+		return nil, false, err
+	}
+
+	// we can embed input hashes on our main configmap to drive rollouts when they change.
+	inputHashes, err := resourcehash.MultipleObjectHashStringMapForObjectReferences(
+		context.TODO(),
+		kubeClient,
+		resourcehash.NewObjectRef().ForConfigMap().InNamespace(util.RouteControllerTargetNamespace).Named("client-ca"),
+		resourcehash.NewObjectRef().ForSecret().InNamespace(util.RouteControllerTargetNamespace).Named("serving-cert"),
 	)
 	if err != nil {
 		return nil, false, err
@@ -330,4 +390,41 @@ func manageOpenShiftControllerManagerDeployment_v311_00_to_latest(client appscli
 	}
 
 	return resourceapply.ApplyDaemonSetWithForce(context.Background(), client, recorder, required, resourcemerge.ExpectedDaemonSetGeneration(required, generationStatus), forceRollout)
+}
+
+func manageRouteControllerManagerDeployment_v311_00_to_latest(client appsclientv1.DeploymentsGetter, countNodes nodeCountFunc, recorder events.Recorder, options *operatorapiv1.OpenShiftControllerManager, imagePullSpec string, generationStatus []operatorapiv1.GenerationStatus, forceRollout bool) (*appsv1.Deployment, bool, error) {
+	required := resourceread.ReadDeploymentV1OrDie(v311_00_assets.MustAsset("v3.11.0/openshift-controller-manager/route-controller-deploy.yaml"))
+
+	if len(imagePullSpec) > 0 {
+		required.Spec.Template.Spec.Containers[0].Image = imagePullSpec
+	}
+
+	level := 2
+	switch options.Spec.LogLevel {
+	case operatorapiv1.TraceAll:
+		level = 8
+	case operatorapiv1.Trace:
+		level = 6
+	case operatorapiv1.Debug:
+		level = 4
+	case operatorapiv1.Normal:
+		level = 2
+	}
+	required.Spec.Template.Spec.Containers[0].Args = append(required.Spec.Template.Spec.Containers[0].Args, fmt.Sprintf("-v=%d", level))
+	if required.Annotations == nil {
+		required.Annotations = map[string]string{}
+	}
+	required.Annotations[util.VersionAnnotation] = os.Getenv("RELEASE_VERSION")
+
+	// Set the replica count to the number of master nodes.
+	masterNodeCount, err := countNodes(required.Spec.Template.Spec.NodeSelector)
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to determine number of master nodes: %v", err)
+	}
+	required.Spec.Replicas = masterNodeCount
+
+	// TODO add EnsureAtMostOnePodPerNode ?
+
+	// TODO change to ApplyDeployment
+	return resourceapply.ApplyDeploymentWithForce(context.Background(), client, recorder, required, resourcemerge.ExpectedDeploymentGeneration(required, generationStatus), forceRollout)
 }

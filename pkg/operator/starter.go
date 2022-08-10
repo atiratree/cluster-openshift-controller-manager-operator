@@ -27,6 +27,7 @@ import (
 	"github.com/openshift/cluster-openshift-controller-manager-operator/pkg/operator/usercaobservation"
 	"github.com/openshift/cluster-openshift-controller-manager-operator/pkg/operator/v311_00_assets"
 	"github.com/openshift/cluster-openshift-controller-manager-operator/pkg/util"
+	workloadcontroller "github.com/openshift/library-go/pkg/operator/apiserver/controller/workload"
 )
 
 func RunOperator(ctx context.Context, controllerConfig *controllercmd.ControllerContext) error {
@@ -75,6 +76,7 @@ func RunOperator(ctx context.Context, controllerConfig *controllercmd.Controller
 		configInformers.Config().V1().Proxies(),
 		kubeInformers,
 		operatorClient.OperatorV1(),
+		workloadcontroller.CountNodesFuncWrapper(kubeInformers.InformersFor("").Core().V1().Nodes().Lister()),
 		kubeClient,
 		controllerConfig.EventRecorder,
 	)
@@ -155,11 +157,13 @@ func RunOperator(ctx context.Context, controllerConfig *controllercmd.Controller
 			"v3.11.0/openshift-controller-manager/leader-rolebinding.yaml",
 			"v3.11.0/openshift-controller-manager/ns.yaml",
 			"v3.11.0/openshift-controller-manager/route-controller-leader-role.yaml",
-			"/v3.11.0/openshift-controller-manager/route-controller-leader-rolebinding.yaml",
+			"v3.11.0/openshift-controller-manager/route-controller-leader-rolebinding.yaml",
 			"v3.11.0/openshift-controller-manager/route-controller-ns.yaml",
 			"v3.11.0/openshift-controller-manager/route-controller-role.yaml",
 			"v3.11.0/openshift-controller-manager/route-controller-rolebinding.yaml",
 			"v3.11.0/openshift-controller-manager/route-controller-sa.yaml",
+			"v3.11.0/openshift-controller-manager/route-controller-separate-sa-role.yaml",
+			"v3.11.0/openshift-controller-manager/route-controller-separate-sa-rolebinding.yaml",
 			"v3.11.0/openshift-controller-manager/route-controller-servicemonitor-role.yaml",
 			"v3.11.0/openshift-controller-manager/route-controller-servicemonitor-rolebinding.yaml",
 			"v3.11.0/openshift-controller-manager/route-controller-svc.yaml",
